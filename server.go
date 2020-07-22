@@ -348,6 +348,11 @@ func serverReader(s *Server, r io.Reader, clientAddr string, responsesChan chan<
 		wr.ID = 0
 		wr.Request = nil
 
+		// 下面这种写法的技巧说明:
+		// 当 select 只有一个 条件选项 和一个 停止(超时)选项 的时候, 将 select 写成这种 非阻塞select(带 default 分支) 的形式, 这种
+		// 写法下 Golang 有优化, 相比多个 条件分支 会减少很多判断和逻辑处理. 因为大多数正常情况下 workersCh 都是缓冲区未满状态, 满足条件.
+		// 两种写法有约 3倍 性能差别.
+
 		select {
 		case workersCh <- struct{}{}:
 		default:
@@ -375,25 +380,28 @@ func serveRequest(s *Server, responsesChan chan<- *serverMessage, stopChan <-cha
 		serverMessagePool.Put(m)
 	}
 
-	t := time.Now()
-	response, err := callHandlerWithRecover(s.LogError, s.Handler, clientAddr, s.Addr, request)
-	s.Stats.incRPCTime(uint64(time.Since(t).Seconds() * 1000))
+	// 同步修改为异步, 因为 service 可以保证消息的单线程执行, 这里就不必要再使用同步阻塞调用, 加大吞吐量
+	// go func() {
+		t := time.Now()
+		response, err := callHandlerWithRecover(s.LogError, s.Handler, clientAddr, s.Addr, request)
+		s.Stats.incRPCTime(uint64(time.Since(t).Seconds() * 1000))
 
-	if !skipResponse {
-		m.Response = response
-		m.Error = err
+		if !skipResponse {
+			m.Response = response
+			m.Error = err
 
-		// Select hack for better performance.
-		// See https://github.com/valyala/gorpc/pull/1 for details.
-		select {
-		case responsesChan <- m:
-		default:
+			// Select hack for better performance.
+			// See https://github.com/valyala/gorpc/pull/1 for details.
 			select {
 			case responsesChan <- m:
-			case <-stopChan:
+			default:
+				select {
+				case responsesChan <- m:
+				case <-stopChan:
+				}
 			}
 		}
-	}
+	// }()
 
 	<-workersCh
 }
